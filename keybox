@@ -1,0 +1,200 @@
+#!/bin/bash
+
+# Copyright (c) 2026 Sabatora <sabatora0843@gmail.com>
+# SPDX-License-Identifier: MIT
+
+ACCOUNT="keybox"
+SUBCMD="$1"
+
+# \n in comment is converted to newline
+parse_comment() {
+    printf '%s' "${1//\\n/$'\n'}"
+}
+
+cmd_add() {
+    local service="$1" value="$2" comment
+    comment="$(parse_comment "$3")"
+
+    if [ -z "$service" ] || [ -z "$value" ]; then
+        echo "Usage: $0 add <service> <value> [comment]"
+        exit 1
+    fi
+
+    if security find-generic-password -a "$ACCOUNT" -s "$service" &>/dev/null; then
+        echo "Error: '$service' already exists. Use 'update' to modify." >&2
+        exit 1
+    fi
+
+    local -a add_args=(-s "$service" -a "$ACCOUNT" -w "$value")
+    if [ -n "$comment" ]; then
+        add_args+=(-j "$comment")
+    fi
+    security add-generic-password "${add_args[@]}"
+    echo "Done."
+}
+
+cmd_list() {
+    security dump-keychain 2>/dev/null | awk -v acct="$ACCOUNT" '
+    function flush_entry(   n, i, lines, indent) {
+        if (account == acct && svce != "") {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", icmt)
+            if (icmt == "") {
+                print svce
+            } else {
+                n = split(icmt, lines, /\n/)
+                if (n <= 1) {
+                    printf "%s  (%s)\n", svce, icmt
+                } else {
+                    printf "%s  (%s\n", svce, lines[1]
+                    indent = sprintf("%*s", length(svce) + 3, "")
+                    for (i = 2; i < n; i++) {
+                        printf "%s%s\n", indent, lines[i]
+                    }
+                    printf "%s%s)\n", indent, lines[n]
+                }
+            }
+        }
+        account = ""; svce = ""; icmt = ""
+    }
+
+    /"acct"<blob>="/ {
+        val = $0
+        sub(/.*"acct"<blob>="/, "", val)
+        sub(/".*/, "", val)
+        account = val
+    }
+    /"svce"<blob>="/ {
+        val = $0
+        sub(/.*"svce"<blob>="/, "", val)
+        sub(/".*/, "", val)
+        svce = val
+    }
+    /"icmt"<blob>=/ {
+        if ($0 ~ /<NULL>/) {
+            icmt = ""
+        } else if ($0 ~ /"icmt"<blob>=0x/) {
+            val = $0
+            sub(/.*"icmt"<blob>=0x/, "", val)
+            sub(/[[:space:]].*/, "", val)
+            cmd = "echo " val " | xxd -r -p"
+            icmt = ""
+            while ((cmd | getline line) > 0) {
+                icmt = icmt (icmt == "" ? "" : "\n") line
+            }
+            close(cmd)
+        } else {
+            val = $0
+            sub(/.*"icmt"<blob>="/, "", val)
+            sub(/".*/, "", val)
+            icmt = val
+        }
+    }
+    /^keychain:/ && NR > 1 {
+        flush_entry()
+    }
+    END {
+        flush_entry()
+    }
+    '
+}
+
+cmd_get() {
+    local service="$1"
+
+    if [ -z "$service" ]; then
+        echo "Usage: $0 get <service>"
+        exit 1
+    fi
+
+    if ! security find-generic-password -a "$ACCOUNT" -s "$service" &>/dev/null; then
+        echo "Error: '$service' is not registered." >&2
+        exit 1
+    fi
+
+    security find-generic-password -a "$ACCOUNT" -s "$service" -w | tr -d '\n'
+}
+
+cmd_update() {
+    local service="$1"
+
+    if [ -z "$service" ]; then
+        echo "Usage:"
+        echo "  $0 update <service> <new-value> [comment]"
+        echo "  $0 update <service> --comment <comment>"
+        exit 1
+    fi
+
+    if ! security find-generic-password -a "$ACCOUNT" -s "$service" &>/dev/null; then
+        echo "Error: '$service' is not registered." >&2
+        exit 1
+    fi
+
+    if [ "$2" = "--comment" ]; then
+        local comment
+        comment="$(parse_comment "$3")"
+        if [ -z "$comment" ]; then
+            echo "Error: comment required after --comment." >&2
+            exit 1
+        fi
+        local current_value
+        current_value="$(security find-generic-password -a "$ACCOUNT" -s "$service" -w)"
+        security add-generic-password -U -s "$service" -a "$ACCOUNT" -w "$current_value" -j "$comment"
+    else
+        local value="$2" comment
+        comment="$(parse_comment "$3")"
+        if [ -z "$value" ]; then
+            echo "Error: new value required." >&2
+            exit 1
+        fi
+        local -a update_args=(-U -s "$service" -a "$ACCOUNT" -w "$value")
+        if [ -n "$comment" ]; then
+            update_args+=(-j "$comment")
+        fi
+        security add-generic-password "${update_args[@]}"
+    fi
+
+    echo "Done."
+}
+
+cmd_delete() {
+    local service="$1"
+
+    if [ -z "$service" ]; then
+        echo "Usage: $0 delete <service>"
+        exit 1
+    fi
+
+    if ! security find-generic-password -a "$ACCOUNT" -s "$service" &>/dev/null; then
+        echo "Error: '$service' is not registered." >&2
+        exit 1
+    fi
+
+    read -r -p "Delete '$service'? [y/N] " confirm
+    case "$confirm" in
+        [yY]) ;;
+        *) echo "Cancelled."; exit 0 ;;
+    esac
+
+    security delete-generic-password -a "$ACCOUNT" -s "$service"
+    echo "Done."
+}
+
+case "$SUBCMD" in
+    add)    cmd_add    "${@:2}" ;;
+    list)   cmd_list            ;;
+    get)    cmd_get    "${@:2}" ;;
+    update) cmd_update "${@:2}" ;;
+    delete) cmd_delete "${@:2}" ;;
+    *)
+        echo "Usage: $0 <subcommand> [options]"
+        echo ""
+        echo "Subcommands:"
+        echo "  add    <service> <value> [comment]"
+        echo "  list"
+        echo "  get    <service>"
+        echo "  update <service> <new-value> [comment]"
+        echo "  update <service> --comment <comment>"
+        echo "  delete <service>"
+        exit 1
+        ;;
+esac
